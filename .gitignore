@@ -1,4 +1,5 @@
 data/
 venv/
+nlp_env/
 scratch.txt
 temp.txt
