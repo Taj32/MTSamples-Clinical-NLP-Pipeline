@@ -3,3 +3,5 @@ venv/
 nlp_env/
 scratch.txt
 temp.txt
+mlflow.db
+__pycache__ 
