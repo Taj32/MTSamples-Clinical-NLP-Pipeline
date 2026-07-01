@@ -104,6 +104,15 @@ def predict_single(
 
     pred_idx   = int(np.argmax(probs))
     pred_label = id2label[pred_idx]
+    
+    warning_message = None
+    if over_limit:
+        warning_message = (
+            f"Report exceeds 512 tokens ({token_count} tokens detected). "
+            f"Text was automatically split into {len(chunks_ids)} overlapping chunks "
+            f"and mean-pooled for classification. "
+            f"SHAP explanation covers first 200 tokens only."
+        )
 
     return {
         "predicted_label": pred_label,
@@ -111,6 +120,7 @@ def predict_single(
         "all_scores":      {id2label[i]: float(p) for i, p in enumerate(probs)},
         "token_count":     token_count,
         "over_512_warning": over_limit,
+        "warning_message": warning_message,
         "n_chunks_used":   len(chunks_ids),
     }
 
