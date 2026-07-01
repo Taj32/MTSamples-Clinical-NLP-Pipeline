@@ -212,3 +212,107 @@ def format_explanation_text(explanation: dict) -> str:
         ]
 
     return "\n".join(lines)
+
+def render_html_explanation(explanation: dict) -> str:
+    """
+    Render token-level SHAP values as a color-coded HTML overlay.
+    Positive SHAP = green highlight (supports prediction).
+    Negative SHAP = red highlight (opposes prediction).
+    Intensity scales with absolute SHAP value.
+    """
+    tokens = explanation["tokens"]
+    shap_values = explanation["shap_values"]
+
+    if not tokens or not shap_values:
+        return "<p>No explanation available.</p>"
+
+    max_val = max(abs(v) for v in shap_values) or 1.0
+
+    html_parts = [
+        f"<div style='font-family: monospace; font-size: 14px; "
+        f"line-height: 2; padding: 16px; background: #f9f9f9; "
+        f"border-radius: 8px;'>",
+        f"<p><strong>Prediction:</strong> {explanation['predicted_label']} "
+        f"({explanation['confidence']:.1%} confidence)</p>",
+        "<p><strong>Token importance overlay "
+        "(green = supports, red = opposes):</strong></p>",
+        "<p style='line-height: 2.5;'>",
+    ]
+
+    for token, value in zip(tokens, shap_values):
+        intensity = abs(value) / max_val
+        alpha = 0.15 + 0.7 * intensity  # min 0.15 so low values still visible
+
+        if value > 0:
+            color = f"rgba(0, 180, 0, {alpha:.2f})"
+        else:
+            color = f"rgba(220, 0, 0, {alpha:.2f})"
+
+        # Tooltip shows exact SHAP value on hover
+        html_parts.append(
+            f"<span style='background-color: {color}; "
+            f"padding: 2px 4px; margin: 1px; border-radius: 3px;' "
+            f"title='SHAP: {value:+.4f}'>{token}</span>"
+        )
+
+    if explanation.get("over_512_warning"):
+        html_parts.append(
+            f"<br><br><em style='color: #888;'>⚠ Report has "
+            f"{explanation['token_count']} tokens — explanation shown "
+            f"for first 200 tokens only.</em>"
+        )
+
+    html_parts.append("</p></div>")
+    return "".join(html_parts)
+
+
+def export_explanation_to_mlflow(
+    explanation: dict,
+    html: str,
+    stage: int,
+    run_name: str = "shap_explanation_sample",
+) -> None:
+    """
+    Export a sample SHAP explanation as MLflow artifacts.
+    Saves: explanation JSON, HTML overlay, and top-tokens text summary.
+    """
+    import mlflow
+    import json
+    from pathlib import Path
+
+    output_dir = Path("outputs/explanations")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save JSON
+    json_path = output_dir / f"stage{stage}_shap_explanation.json"
+    safe_explanation = {k: v for k, v in explanation.items()
+                        if k != "shap_values"}  # shap_values is a list, fine to keep
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(explanation, f, indent=2)
+
+    # Save HTML overlay
+    html_path = output_dir / f"stage{stage}_shap_overlay.html"
+    full_html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset='utf-8'>
+<title>Stage {stage} SHAP Explanation</title>
+</head><body>
+{html}
+<hr>
+<pre>{format_explanation_text(explanation)}</pre>
+</body></html>"""
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(full_html)
+
+    # Log to MLflow
+    mlflow.set_experiment(f"stage{stage}_shap_explanations")
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_artifact(str(json_path))
+        mlflow.log_artifact(str(html_path))
+        mlflow.log_metrics({
+            "explanation_confidence": explanation["confidence"],
+            "n_tokens_explained": len(explanation["tokens"]),
+            "top_token_shap": abs(explanation["top_tokens"][0][1])
+            if explanation["top_tokens"] else 0.0,
+        })
+    print(f"Exported explanation artifacts to MLflow and {output_dir}/")

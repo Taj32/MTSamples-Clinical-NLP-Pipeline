@@ -5,6 +5,8 @@ from src.explainability.shap_explainer import (
     predict_single,
     get_shap_explanation,
     format_explanation_text,
+    render_html_explanation,
+    export_explanation_to_mlflow
 )
 
 # Load both models
@@ -40,3 +42,17 @@ explanation = get_shap_explanation(
     sample, s2_model, s2_tokenizer, s2_id2label, stage=2, n_samples=50
 )
 print(format_explanation_text(explanation))
+
+print("\n=== HTML OVERLAY ===")
+html = render_html_explanation(explanation)
+# Save locally so you can open it in a browser
+from pathlib import Path
+Path("outputs/explanations").mkdir(parents=True, exist_ok=True)
+with open("outputs/explanations/test_overlay.html", "w", encoding="utf-8") as f:
+    f.write(html)
+print("HTML overlay saved to outputs/explanations/test_overlay.html")
+print("Open that file in your browser to see the color-coded token overlay.")
+
+print("\n=== EXPORTING TO MLFLOW ===")
+export_explanation_to_mlflow(explanation, html, stage=2)
+print("Done.")
