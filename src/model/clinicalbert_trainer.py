@@ -4,7 +4,7 @@ import pandas as pd
 import mlflow
 import json
 from pathlib import Path
-from torch import nn
+from torch import device, nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer,
@@ -22,6 +22,10 @@ from loguru import logger
 
 from src.stage1_doctype.label_consolidation import get_class_weights
 from datetime import datetime
+
+from src.stage1_doctype.structural_features import extract_structural_features
+from src.stage1_doctype.structural_features import N_STRUCTURAL_FEATURES
+
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -59,12 +63,14 @@ class ClinicalNotesDataset(Dataset):
         over_limit = 0
         for text, label in zip(texts, labels):
             chunks = self._chunk_text(text)
+            struct_feats = extract_structural_features(text)   # added for structural features
             if len(chunks["input_ids"]) > max_chunks:
                 over_limit += 1
             self.samples.append({
                 "input_ids":      chunks["input_ids"][:max_chunks],
                 "attention_mask": chunks["attention_mask"][:max_chunks],
                 "label":          label,
+                "structural_features": struct_feats, # Added for structural features
             })
 
         logger.info(
@@ -137,6 +143,7 @@ def collate_fn(batch):
     padded_ids  = []
     padded_mask = []
     labels      = []
+    struct_feats = []
 
     for sample in batch:
         n = len(sample["input_ids"])
@@ -154,15 +161,33 @@ def collate_fn(batch):
         padded_ids.append(ids)
         padded_mask.append(mask)
         labels.append(sample["label"])
+        struct_feats.append(torch.from_numpy(sample["structural_features"]))
 
     return {
         "input_ids":      torch.stack(padded_ids),
         "attention_mask": torch.stack(padded_mask),
         "labels":         torch.tensor(labels, dtype=torch.long),
+        "structural_features": torch.stack(struct_feats),
     }
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha  # class weight tensor, same as before
+        self.gamma = gamma  # focusing parameter — higher = more focus on hard examples
+
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(logits, targets, weight=self.alpha, reduction="none")
+        pt = torch.exp(-ce_loss)  # model's confidence on the true class
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
 class ChunkPoolClinicalBERT(nn.Module):
     """
     ClinicalBERT with mean-pool across chunks for long-document classification.
@@ -175,39 +200,61 @@ class ChunkPoolClinicalBERT(nn.Module):
       5. Dropout → linear classification head
     """
 
-    def __init__(self, n_classes: int, dropout: float = 0.1):
+    def __init__(self, n_classes: int, n_structural_features: int = 0, dropout: float = 0.1):
         super().__init__()
-        self.bert      = AutoModel.from_pretrained(MODEL_NAME)
-        hidden_size    = self.bert.config.hidden_size  # 768 for BERT-base
-        self.dropout   = nn.Dropout(dropout)
-        self.classifier = nn.Linear(hidden_size, n_classes)
+        self.bert = AutoModel.from_pretrained(MODEL_NAME)
+        hidden_size = self.bert.config.hidden_size
+        self.dropout = nn.Dropout(dropout)
+        self.n_structural_features = n_structural_features
+        self.classifier = nn.Linear(hidden_size + n_structural_features, n_classes)
+        
+    # def forward(self, input_ids, attention_mask):
+    #     """
+    #     input_ids:      (batch, n_chunks, seq_len)
+    #     attention_mask: (batch, n_chunks, seq_len)
+    #     """
+    #     batch, n_chunks, seq_len = input_ids.shape
 
-    def forward(self, input_ids, attention_mask):
-        """
-        input_ids:      (batch, n_chunks, seq_len)
-        attention_mask: (batch, n_chunks, seq_len)
-        """
+    #     # Flatten chunks into batch dimension
+    #     ids_flat  = input_ids.view(batch * n_chunks, seq_len)
+    #     mask_flat = attention_mask.view(batch * n_chunks, seq_len)
+
+    #     # BERT forward — only pass non-padding chunks
+    #     # (chunks with all-zero attention mask still run but contribute 0 after pool)
+    #     outputs = self.bert(input_ids=ids_flat, attention_mask=mask_flat)
+    #     cls_embeddings = outputs.last_hidden_state[:, 0, :]  # [CLS] token
+
+    #     # Reshape back to (batch, n_chunks, hidden)
+    #     cls_embeddings = cls_embeddings.view(batch, n_chunks, -1)
+
+    #     # Mean pool across chunks (ignoring all-padding chunks)
+    #     # Build chunk mask: a chunk is valid if its attention mask has any 1s
+    #     chunk_valid = attention_mask.sum(dim=-1) > 0  # (batch, n_chunks)
+    #     chunk_valid = chunk_valid.unsqueeze(-1).float()  # (batch, n_chunks, 1)
+
+    #     pooled = (cls_embeddings * chunk_valid).sum(dim=1)
+    #     pooled = pooled / chunk_valid.sum(dim=1).clamp(min=1)  # (batch, hidden)
+
+    #     return self.classifier(self.dropout(pooled))
+    
+    def forward(self, input_ids, attention_mask, structural_features=None):
         batch, n_chunks, seq_len = input_ids.shape
 
-        # Flatten chunks into batch dimension
         ids_flat  = input_ids.view(batch * n_chunks, seq_len)
         mask_flat = attention_mask.view(batch * n_chunks, seq_len)
 
-        # BERT forward — only pass non-padding chunks
-        # (chunks with all-zero attention mask still run but contribute 0 after pool)
         outputs = self.bert(input_ids=ids_flat, attention_mask=mask_flat)
-        cls_embeddings = outputs.last_hidden_state[:, 0, :]  # [CLS] token
-
-        # Reshape back to (batch, n_chunks, hidden)
+        cls_embeddings = outputs.last_hidden_state[:, 0, :]
         cls_embeddings = cls_embeddings.view(batch, n_chunks, -1)
 
-        # Mean pool across chunks (ignoring all-padding chunks)
-        # Build chunk mask: a chunk is valid if its attention mask has any 1s
-        chunk_valid = attention_mask.sum(dim=-1) > 0  # (batch, n_chunks)
-        chunk_valid = chunk_valid.unsqueeze(-1).float()  # (batch, n_chunks, 1)
+        chunk_valid = attention_mask.sum(dim=-1) > 0
+        chunk_valid = chunk_valid.unsqueeze(-1).float()
 
         pooled = (cls_embeddings * chunk_valid).sum(dim=1)
-        pooled = pooled / chunk_valid.sum(dim=1).clamp(min=1)  # (batch, hidden)
+        pooled = pooled / chunk_valid.sum(dim=1).clamp(min=1)
+
+        if self.n_structural_features > 0 and structural_features is not None:
+            pooled = torch.cat([pooled, structural_features], dim=-1)
 
         return self.classifier(self.dropout(pooled))
 
@@ -232,7 +279,10 @@ def evaluate(model, loader, device, id2label) -> dict:
             mask = batch["attention_mask"].to(device)
             lbls = batch["labels"].to(device)
 
-            logits = model(ids, mask)
+            struct_feats = batch["structural_features"].to(DEVICE)
+            logits = model(ids, mask, struct_feats)
+
+            #logits = model(ids, mask)
             preds  = logits.argmax(dim=-1)
 
             all_preds.extend(preds.cpu().numpy())
@@ -278,6 +328,9 @@ def train_clinicalbert(
     lr: float = 2e-5,
     warmup_ratio: float = 0.1,
     dropout: float = 0.1,
+    override_weights: dict = None,   # add this
+    use_focal_loss: bool = False,   # add this
+    focal_gamma: float = 2.0,       # add this
 ):
     logger.info(f"Training Stage {stage} ClinicalBERT on {DEVICE}")
     logger.info(f"Model: {MODEL_NAME}")
@@ -331,15 +384,32 @@ def train_clinicalbert(
 
     # ── Model ──────────────────────────────────────────────────────────────
     logger.info("Loading ClinicalBERT...")
-    model = ChunkPoolClinicalBERT(n_classes=n_classes, dropout=dropout).to(DEVICE)
+    #model = ChunkPoolClinicalBERT(n_classes=n_classes, dropout=dropout).to(DEVICE)
+    n_struct = N_STRUCTURAL_FEATURES if stage == 1 else 0
+    model = ChunkPoolClinicalBERT(n_classes=n_classes, n_structural_features=n_struct, dropout=dropout).to(DEVICE)
 
     # ── Loss with class weights ────────────────────────────────────────────
+
+        
+    
+    
     weights_dict = get_class_weights(train_df[label_col])
+    if override_weights:
+        weights_dict.update(override_weights)
+        logger.info(f"Using override weights: {override_weights}")
+        
     weight_tensor = torch.tensor(
         [weights_dict[id2label[i]] for i in range(n_classes)],
         dtype=torch.float
     ).to(DEVICE)
-    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+
+    if use_focal_loss:
+        criterion = FocalLoss(alpha=weight_tensor, gamma=focal_gamma)
+        logger.info(f"Using FocalLoss with gamma={focal_gamma}")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+    #criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+
 
     # ── Optimizer & scheduler ──────────────────────────────────────────────
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -384,9 +454,13 @@ def train_clinicalbert(
                 ids  = batch["input_ids"].to(DEVICE)
                 mask = batch["attention_mask"].to(DEVICE)
                 lbls = batch["labels"].to(DEVICE)
+                
+                struct_feats = batch.get("structural_features")
+                if struct_feats is not None:
+                    struct_feats = struct_feats.to(DEVICE)
 
                 optimizer.zero_grad()
-                logits = model(ids, mask)
+                logits = model(ids, mask, struct_feats)
                 loss   = criterion(logits, lbls)
                 loss.backward()
 

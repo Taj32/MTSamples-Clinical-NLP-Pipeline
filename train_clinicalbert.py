@@ -37,22 +37,85 @@
 # print(f"  Test Macro F1:     {results['test_macro_f1']:.4f}")
 # print(f"  Test Accuracy:     {results['test_accuracy']:.4f}")
 
-# train_clinicalbert.py
-from src.stage2_specialty.clinicalbert_trainer import train_clinicalbert
+# ===============================================================================================
 
-print("Starting Stage 2 ClinicalBERT — run 3 (early stopping focus)")
-print("Key changes: lower lr (1e-5), back to batch=8, 4 epochs, higher dropout\n")
+# # train_clinicalbert.py
+# from src.model.clinicalbert_trainer import train_clinicalbert
+
+# print("Starting Stage 1 ClinicalBERT — document type classifier")
+# print("5 classes, 3,476 training samples, expect faster convergence\n")
+
+# results = train_clinicalbert(
+#     # stage=1,
+#     # epochs=4,
+#     # batch_size=8,
+#     # lr=2e-5,
+#     # warmup_ratio=0.15,
+#     # dropout=0.2,
+#     # override_weights={
+#     #     "specialty_report":   4.0,   # heavily boost the majority-but-hard class
+#     #     "consultation":       2.0,
+#     #     "discharge_summary":  3.0,
+#     #     "procedure_note":     0.5,   # penalize over-predicting this
+#     #     "progress_note":      2.5,
+#     # }
+#     stage=1,
+#     epochs=5,
+#     batch_size=8,
+#     lr=2e-5,
+#     warmup_ratio=0.15,
+#     dropout=0.2,
+#     override_weights=None,   # use plain inverse-frequency weights, same as run A
+#     use_focal_loss=True,     # new flag
+#     focal_gamma=2.0,
+# )
+
+# print(f"\nFocal Loss Stage 1 Run Results:")
+# print(f"  Best Val Macro F1: {results['best_val_f1']:.4f}")
+# print(f"  Test Macro F1:     {results['test_macro_f1']:.4f}")
+# print(f"  Test Accuracy:     {results['test_accuracy']:.4f}")
+# print(f"\nCompare to run A (cross-entropy, same weights): test F1 = 0.5102")
+
+# =======================================================================================================
+# train_clinicalbert.py
+from src.model.clinicalbert_trainer import train_clinicalbert
+
+print("Starting Stage 1 ClinicalBERT — structural features experiment")
+print("Adding 7 structural features (section markers, tense ratio, doc length)\n")
 
 results = train_clinicalbert(
-    stage=2,
-    epochs=4,
-    batch_size=8,    # back to 8 — faster per epoch, less overfitting pressure
-    lr=1e-5,         # lower than run 2 (3e-5 overfit by epoch 4)
-    warmup_ratio=0.2,  # longer warmup for gentle start
-    dropout=0.3,     # higher dropout — run 2 showed overfitting, need more regularization
+    stage=1,
+    epochs=5,
+    batch_size=8,
+    lr=2e-5,
+    warmup_ratio=0.15,
+    dropout=0.2,
+    use_focal_loss=True,
+    focal_gamma=2.0,
 )
 
-print(f"\nRun 3 Results:")
+print(f"\nStructural Features Run Results:")
 print(f"  Best Val Macro F1: {results['best_val_f1']:.4f}")
 print(f"  Test Macro F1:     {results['test_macro_f1']:.4f}")
-print(f"  Test Accuracy:     {results['test_accuracy']:.4f}")
+print(f"\nCompare to focal loss run (no structural features): test F1 = 0.5276")
+
+# =======================================================================================================
+
+
+# # train_clinicalbert.py
+# from model.clinicalbert_trainer import train_clinicalbert
+
+# print("Starting Stage 2 ClinicalBERT — run 3 (early stopping focus)")
+# print("Key changes: lower lr (1e-5), back to batch=8, 4 epochs, higher dropout\n")
+
+# results = train_clinicalbert(
+#     stage=2,
+#     epochs=4,
+#     batch_size=8,
+#     lr=2e-5,
+# )
+
+# print(f"\nRun 3 Results:")
+# print(f"  Best Val Macro F1: {results['best_val_f1']:.4f}")
+# print(f"  Test Macro F1:     {results['test_macro_f1']:.4f}")
+# print(f"  Test Accuracy:     {results['test_accuracy']:.4f}")
